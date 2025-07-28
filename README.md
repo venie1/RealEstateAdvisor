@@ -1,7 +1,7 @@
 # RealEstateAdvisor
 
 ## DESCRIPTION
-
+Worked with a team of 6 professionals from all over the world with weekly meetings and constant communcation and deadlines to achieve a rigorous result.
 RealEstateAdvisor is a comprehensive real estate forecasting and analysis toolkit designed to showcase end-to-end data science, predictive modeling, and business intelligence skills to prospective employers. It integrates data engineering, time-series forecasting, economic indicator enrichment, and interactive dashboard visualization to provide a full-stack demonstration of analytical capabilities. Data were gathered by Redfin and U.S Bureau
 
 Key components include:
