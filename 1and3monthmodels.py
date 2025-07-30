@@ -1,53 +1,70 @@
 
 
-import pandas as pd
-import numpy as np
+# Standard and third-party library imports
+import os
+import time
 import warnings
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import json
+from datetime import datetime, timedelta
+from joblib import Parallel, delayed
+import multiprocessing
+import joblib
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.model_selection import TimeSeriesSplit, GridSearchCV
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score, mean_absolute_percentage_error
+from sklearn.linear_model import RidgeCV, Ridge, ElasticNet
+from sklearn.pipeline import Pipeline
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.impute import SimpleImputer
+from sklearn.compose import ColumnTransformer
+from xgboost import XGBRegressor
+from tqdm import tqdm
+from tqdm_joblib import tqdm_joblib
+
+# Suppress warnings for cleaner output
 warnings.filterwarnings('ignore')
+pd.options.mode.chained_assignment = None
+warnings.filterwarnings('ignore', category=pd.errors.SettingWithCopyWarning)
+warnings.filterwarnings('ignore', category=FutureWarning)
+
+# File paths for input data
 imputed_path = 'combined_df_processed.csv'
 county_market_path = 'county_market_tracker_updated.tsv000'
+
+# Load and preprocess the main imputed dataset
 imputed_df = pd.read_csv(imputed_path)
-
-# Rename 'period_end' to 'period_begin' so the downstream code works correctly.
 imputed_df.rename(columns={'period_end': 'period_begin'}, inplace=True)
-
-# Convert the period_begin column to datetime
 imputed_df['period_begin'] = pd.to_datetime(imputed_df['period_begin'])
-
-# Extract the unique regions and the earliest date for later filtering
 regions = imputed_df['region'].unique()
 earliest_date = imputed_df['period_begin'].min()
 
-# Read the county market data as before
+# Load and filter the county market data
 county_market_df = pd.read_csv(county_market_path, sep='\t')
 county_market_df['period_begin'] = pd.to_datetime(county_market_df['period_begin'])
-
-# Filter county_market_df: keep only rows for desired regions and dates on/after earliest_date
 filtered_county_market_df = county_market_df[
     (county_market_df['region'].isin(regions)) &
     (county_market_df['period_begin'] >= earliest_date)
 ]
-# Define the columns to keep (metrics plus period_begin, region, and property_type)
+
+# Select relevant columns for modeling
 columns_to_keep = [
-    'median_sale_price',
-    'inventory',
-    'homes_sold',
-    'median_dom',
-    'avg_sale_to_list',
-    'pending_sales',  # Make sure these columns exist in county_market_df if necessary
-    'new_listings',
-    'sold_above_list',
-    'median_ppsf',
+    'median_sale_price', 'inventory', 'homes_sold', 'median_dom', 'avg_sale_to_list',
+    'pending_sales', 'new_listings', 'sold_above_list', 'median_ppsf',
     'B19013_001E', 'B17001_002E', 'B15003_022E', 'B23025_005E', 'B01003_001E',
-    'mortgage rate', 'fed interest rate',
-    'period_begin', 'region','property_type'
+    'mortgage rate', 'fed interest rate', 'period_begin', 'region', 'property_type'
 ]
 filtered_county_market_df = filtered_county_market_df[columns_to_keep]
-
-# Create a monthly period column
 filtered_county_market_df['month_period'] = filtered_county_market_df['period_begin'].dt.to_period('M')
-# Function to create a complete monthly DataFrame
+
 def create_complete_monthly_df(df, group_cols):
+    """
+    Generate a DataFrame with complete monthly periods for each group.
+    Missing months are filled with forward-filled values for each group.
+    """
     monthly_df = df.groupby(group_cols + ['month_period']).mean(numeric_only=True).reset_index()
     full_month_range = pd.period_range(start=filtered_county_market_df['period_begin'].min(),
                                        end=filtered_county_market_df['period_begin'].max(),
@@ -56,7 +73,7 @@ def create_complete_monthly_df(df, group_cols):
     for group_val in monthly_df[group_cols[0]].unique():
         group_df = monthly_df[monthly_df[group_cols[0]] == group_val].set_index('month_period')
         group_df = group_df.reindex(full_month_range)
-        group_df[group_cols[0]] = group_val  # reintroduce region
+        group_df[group_cols[0]] = group_val
         for col in group_cols[1:]:
             group_df[col] = group_df[col].ffill()
         group_df = group_df.reset_index().rename(columns={'index': 'month_period'})
@@ -68,43 +85,49 @@ def create_complete_monthly_df(df, group_cols):
     complete_monthly_df = complete_monthly_df[final_cols]
     return complete_monthly_df
 
-# Function to impute missing series values
 def impute_series(df, metrics_cols, training_medians=None):
+    """
+    Impute missing values in the given columns using forward fill, backward fill, and optionally training medians.
+    """
     df = df.sort_values('period_begin').copy()
     df[metrics_cols] = df[metrics_cols].fillna(method='ffill')
     df[metrics_cols] = df[metrics_cols].fillna(method='bfill')
     if training_medians is not None:
         for col in metrics_cols:
-            df[col] = df[col].fillna(training_medians[col])
+            df[col] = df[col].fillna(training_medians.get(col, df[col].median() if not df[col].empty else 0))
     else:
-        df[metrics_cols] = df[metrics_cols].fillna(df[metrics_cols].median())
+        for col in metrics_cols:
+            if col in df.columns:
+                df[col] = df[col].fillna(df[col].median() if not df[col].empty else 0)
     return df
 
-# Function to calculate year-over-year (yoy) changes in median sale price
 def calculate_yoy(df):
+    """
+    Calculate year-over-year (YoY) percentage change in median sale price for each region.
+    """
     df = df.sort_values(['region', 'period_begin']).copy()
     df['prev_year_price'] = df.groupby('region')['median_sale_price'].shift(12)
     df['yoy'] = (df['median_sale_price'] - df['prev_year_price']) / df['prev_year_price']
-    df['yoy'] = np.where((df['prev_year_price'] == 0) | (df['prev_year_price'].isna()),
-                         np.nan, df['yoy'])
+    df['yoy'] = np.where((df['prev_year_price'] == 0) | (df['prev_year_price'].isna()), np.nan, df['yoy'])
     df['yoy'] = (df['yoy'] * 100).round(2)
     df.drop(columns=['prev_year_price'], inplace=True)
     return df
-# Create complete monthly dataframe using the filtered county market dataset
-monthly_df_full = create_complete_monthly_df(filtered_county_market_df, group_cols=['region'])
-# Split the data into training and testing sets per region
+
+# Prepare a complete monthly DataFrame for all regions
+total_monthly_df = create_complete_monthly_df(filtered_county_market_df, group_cols=['region'])
+
+# Split data into training and testing sets for each region
 train_list, test_list = [], []
-for county in monthly_df_full['region'].unique():
-    county_data = monthly_df_full[monthly_df_full['region'] == county].sort_values('period_begin')
+for county in total_monthly_df['region'].unique():
+    county_data = total_monthly_df[total_monthly_df['region'] == county].sort_values('period_begin')
     split_idx = int(0.8 * len(county_data))
     train_list.append(county_data.iloc[:split_idx])
     test_list.append(county_data.iloc[split_idx:])
-
 train_df_full = pd.concat(train_list)
 test_df_full = pd.concat(test_list)
-metrics_columns_full = [col for col in monthly_df_full.columns if col not in ['region', 'period_begin']]
+metrics_columns_full = [col for col in total_monthly_df.columns if col not in ['region', 'period_begin']]
 
-# Impute missing values for train data
+# Impute missing values for training data
 imputed_train_list = []
 for county in train_df_full['region'].unique():
     county_train = train_df_full[train_df_full['region'] == county].copy()
@@ -113,7 +136,7 @@ for county in train_df_full['region'].unique():
     imputed_train_list.append(county_train_imputed)
 imputed_train_df_full = pd.concat(imputed_train_list, ignore_index=True)
 
-# Impute missing values for test data
+# Impute missing values for test data using training medians or global medians
 imputed_test_list = []
 for county in test_df_full['region'].unique():
     county_test = test_df_full[test_df_full['region'] == county].copy().sort_values('period_begin')
@@ -138,15 +161,14 @@ for county in test_df_full['region'].unique():
     imputed_test_list.append(county_test_imputed)
 imputed_test_df_full = pd.concat(imputed_test_list, ignore_index=True)
 
-# Combine the train and test imputed data
+# Combine imputed training and test data for final analysis
 final_imputed_df_full = pd.concat([imputed_train_df_full, imputed_test_df_full], ignore_index=True)
 final_imputed_df_full.sort_values(['region', 'period_begin'], inplace=True)
 final_imputed_df_full = calculate_yoy(final_imputed_df_full)
 
-# Process separate dataframes by property_type as done originally
+# Process data separately for each property type
 property_types = filtered_county_market_df['property_type'].unique()
-final_dfs = {}  
-
+final_dfs = {}
 for ptype in property_types:
     df_ptype = filtered_county_market_df[filtered_county_market_df['property_type'] == ptype].copy()
     monthly_df = create_complete_monthly_df(df_ptype, group_cols=['region', 'property_type'])
@@ -190,7 +212,6 @@ for ptype in property_types:
             county_test_imputed[metrics_columns] = county_test_imputed[metrics_columns].fillna(global_train_medians)
         imputed_test_list.append(county_test_imputed)
     imputed_test_df = pd.concat(imputed_test_list, ignore_index=True)
-    
     final_imputed_df = pd.concat([imputed_train_df, imputed_test_df], ignore_index=True)
     final_imputed_df.sort_values(['region', 'period_begin'], inplace=True)
     final_imputed_df = calculate_yoy(final_imputed_df)
@@ -1087,7 +1108,7 @@ for df, prop_type in dataframe_mappings:
     
     df_copy = df_copy.rename(columns={
         'forecast_date': 'date',
-        'forecast_price': 'forecasted_price',
+        'forecasted_price': 'forecasted_price',
         'yoy_growth_pct': 'forecast_yoy'
     })
     
