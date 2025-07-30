@@ -1,24 +1,12 @@
-#!/usr/bin/env python
-# coding: utf-8
-
-# In[1]:
 
 
 import pandas as pd
 import numpy as np
 import warnings
 warnings.filterwarnings('ignore')
-
-# Use the new dataset path instead of the original one
 imputed_path = 'combined_df_processed.csv'
 county_market_path = 'county_market_tracker_updated.tsv000'
-
-# Read the new imputed dataset
 imputed_df = pd.read_csv(imputed_path)
-
-# Optional: If the dataset includes an unnecessary 'Unnamed: 0' column (for instance, an index),
-# you can drop it. Uncomment the next line if desired.
-# imputed_df = imputed_df.drop(columns=['Unnamed: 0'])
 
 # Rename 'period_end' to 'period_begin' so the downstream code works correctly.
 imputed_df.rename(columns={'period_end': 'period_begin'}, inplace=True)
@@ -39,10 +27,7 @@ filtered_county_market_df = county_market_df[
     (county_market_df['region'].isin(regions)) &
     (county_market_df['period_begin'] >= earliest_date)
 ]
-
-# =============================================================================
 # Define the columns to keep (metrics plus period_begin, region, and property_type)
-# Depending on your needs, you might want to adjust or add any new columns from the new dataset.
 columns_to_keep = [
     'median_sale_price',
     'inventory',
@@ -61,7 +46,6 @@ filtered_county_market_df = filtered_county_market_df[columns_to_keep]
 
 # Create a monthly period column
 filtered_county_market_df['month_period'] = filtered_county_market_df['period_begin'].dt.to_period('M')
-
 # Function to create a complete monthly DataFrame
 def create_complete_monthly_df(df, group_cols):
     monthly_df = df.groupby(group_cols + ['month_period']).mean(numeric_only=True).reset_index()
@@ -106,10 +90,8 @@ def calculate_yoy(df):
     df['yoy'] = (df['yoy'] * 100).round(2)
     df.drop(columns=['prev_year_price'], inplace=True)
     return df
-
 # Create complete monthly dataframe using the filtered county market dataset
 monthly_df_full = create_complete_monthly_df(filtered_county_market_df, group_cols=['region'])
-
 # Split the data into training and testing sets per region
 train_list, test_list = [], []
 for county in monthly_df_full['region'].unique():
